@@ -1911,6 +1911,10 @@ class AIAgent:
         self.logs_dir = hermes_home / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+        # Foreground CLI code opts this in after constructing the main agent.
+        # Background tasks/subagents inherit cmux env vars, so defaulting this
+        # on here would let them steal the focused-surface mapping.
+        self._publish_cmux_surface_sidecar = False
         self._write_current_session_sidecar()
 
         # Track conversation messages for session logging
@@ -5199,6 +5203,19 @@ class AIAgent:
         content = re.sub(r'(</think>)\n+', r'\1\n', content)
         return content.strip()
 
+    def _safe_sidecar_key(self, value: str) -> str:
+        """Return a filesystem-safe sidecar key without allowing path escape."""
+        key = re.sub(r"[^A-Za-z0-9_.:-]", "_", (value or "").strip())
+        return key[:200]
+
+    def _current_tty_name(self) -> str:
+        try:
+            if sys.stdin is not None and sys.stdin.isatty():
+                return os.ttyname(sys.stdin.fileno())
+        except Exception:
+            pass
+        return ""
+
     def _write_current_session_sidecar(self) -> None:
         try:
             hermes_home = get_hermes_home()
@@ -5207,33 +5224,33 @@ class AIAgent:
                 "session_id": self.session_id,
                 "pid": os.getpid(),
                 "cwd": os.getcwd(),
+                "platform": self.platform,
                 "updated_at": updated_at,
                 "session_json": str(self.session_log_file),
             }
             atomic_json_write(hermes_home / "current-session.json", payload)
 
-            surface_id = os.getenv("CMUX_SURFACE_ID", "").strip()
-            if self.platform == "cli" and not self.quiet_mode and surface_id:
-                safe_surface_id = re.sub(r"[^A-Za-z0-9._-]", "_", surface_id)
-                if safe_surface_id:
-                    tty = ""
-                    try:
-                        if os.isatty(0):
-                            tty = os.ttyname(0)
-                    except Exception:
-                        tty = ""
-                    cmux_payload = {
-                        **payload,
-                        "cmux": {
-                            "workspace_id": os.getenv("CMUX_WORKSPACE_ID", ""),
-                            "surface_id": surface_id,
-                            "socket_path": os.getenv("CMUX_SOCKET_PATH", ""),
-                            "tty": tty,
-                        },
+            surface_id = (os.environ.get("CMUX_SURFACE_ID") or "").strip()
+            if (
+                getattr(self, "_publish_cmux_surface_sidecar", False)
+                and (self.platform or "") == "cli"
+                and surface_id
+            ):
+                sidecar_key = self._safe_sidecar_key(surface_id)
+                if sidecar_key:
+                    surface_dir = hermes_home / "current-sessions" / "by-cmux-surface"
+                    surface_dir.mkdir(parents=True, exist_ok=True)
+                    surface_payload = dict(payload)
+                    surface_payload["cmux"] = {
+                        "workspace_id": os.environ.get("CMUX_WORKSPACE_ID", ""),
+                        "surface_id": surface_id,
+                        "socket_path": os.environ.get("CMUX_SOCKET_PATH", ""),
+                        "tty": self._current_tty_name(),
                     }
-                    sidecar_dir = hermes_home / "current-sessions" / "by-cmux-surface"
-                    sidecar_dir.mkdir(parents=True, exist_ok=True)
-                    atomic_json_write(sidecar_dir / f"{safe_surface_id}.json", cmux_payload)
+                    atomic_json_write(
+                        surface_dir / f"{sidecar_key}.json",
+                        surface_payload,
+                    )
         except Exception as e:
             logger.debug("Could not write current-session sidecar: %s", e)
 
