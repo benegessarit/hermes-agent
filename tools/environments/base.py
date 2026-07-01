@@ -379,18 +379,16 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # The temp name MUST be unique per concurrent writer. ``$$`` is the
+        # parent shell PID in backgrounded subshells, while ``$BASHPID`` is not
+        # available in macOS' Bash 3.2.  Use ``${BASHPID:-$$}`` plus two
+        # per-assignment ``$RANDOM`` values, store it once, and reuse that same
+        # temp path for export/mv/rm so even older Bash builds avoid temp-file
+        # collisions under concurrent writers.
+        _snap_tmp_prefix = shlex.quote(self._snapshot_path + ".tmp.")
         bootstrap = (
-            f"export -p > {_snap_tmp}\n"
+            f"__hermes_snap_tmp={_snap_tmp_prefix}${{BASHPID:-$$}}.${{RANDOM:-0}}.${{RANDOM:-0}}\n"
+            f"export -p > \"$__hermes_snap_tmp\"\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -405,14 +403,14 @@ class BaseEnvironment(ABC):
             # very functions we meant to drop.
             f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
             f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
-            f">> {_snap_tmp} 2>/dev/null || true\n"
-            f"alias -p >> {_snap_tmp}\n"
-            f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
-            f"echo 'set +e' >> {_snap_tmp}\n"
-            f"echo 'set +u' >> {_snap_tmp}\n"
+            f">> \"$__hermes_snap_tmp\" 2>/dev/null || true\n"
+            f"alias -p >> \"$__hermes_snap_tmp\"\n"
+            f"echo 'shopt -s expand_aliases' >> \"$__hermes_snap_tmp\"\n"
+            f"echo 'set +e' >> \"$__hermes_snap_tmp\"\n"
+            f"echo 'set +u' >> \"$__hermes_snap_tmp\"\n"
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"mv -f \"$__hermes_snap_tmp\" {_quoted_snap} || rm -f \"$__hermes_snap_tmp\"\n"
             f"builtin cd {_quoted_cwd} 2>/dev/null || true\n"
             f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
@@ -469,11 +467,11 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shlex-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file.  The suffix mirrors init_session's
+        # portable Bash 3.2+ contract: prefer BASHPID where available, but add
+        # per-assignment RANDOM values so macOS Bash (no BASHPID) still uses
+        # distinct temp names across concurrent writers.
+        _snap_tmp_prefix = shlex.quote(self._snapshot_path + ".tmp.")
 
         parts = []
 
@@ -504,8 +502,9 @@ class BaseEnvironment(ABC):
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
             parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"__hermes_snap_tmp={_snap_tmp_prefix}${{BASHPID:-$$}}.${{RANDOM:-0}}.${{RANDOM:-0}}; "
+                f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_quoted_snap}; }} "
+                f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true"
             )
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)

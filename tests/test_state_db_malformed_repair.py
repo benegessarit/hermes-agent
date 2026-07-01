@@ -13,6 +13,8 @@ cannot be handled at the FTS-rebuild layer. These tests verify the
 sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
 import sqlite3
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -36,21 +38,61 @@ def _build_healthy_db(db_path: Path) -> str:
     return sid
 
 
+def _run_sqlite_cli_corruption(db_path: Path, sql: str) -> None:
+    sqlite3_cli = shutil.which("sqlite3")
+    if not sqlite3_cli:
+        pytest.skip(
+            "embedded sqlite disables writable_schema and sqlite3 CLI is unavailable"
+        )
+    subprocess.run(
+        [sqlite3_cli, str(db_path)],
+        input=sql,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def _execute_corruption_sql(db_path: Path, sql: str) -> None:
+    """Run corruption SQL, falling back when embedded SQLite is defensive.
+
+    The pyenv/macOS SQLite build used by the canonical runner reports
+    ``PRAGMA writable_schema`` as hard-disabled, so Python writes to
+    ``sqlite_master``/FTS5 shadow tables raise "may not be modified". The
+    system sqlite3 CLI still permits the surgical corruption fixtures, keeping
+    these tests as real repair coverage instead of Darwin-only skips.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        for statement in sql.split(";"):
+            statement = statement.strip()
+            if statement:
+                conn.execute(statement)
+        return
+    except sqlite3.OperationalError as exc:
+        if "may not be modified" not in str(exc):
+            raise
+    finally:
+        conn.close()
+
+    _run_sqlite_cli_corruption(db_path, sql)
+
+
 def _corrupt_duplicate_fts(db_path: Path) -> None:
     """Inject a duplicate messages_fts row into sqlite_master.
 
     Reproduces 'malformed database schema (messages_fts) - table
     messages_fts already exists'.
     """
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA writable_schema=ON")
-    conn.execute(
-        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
-        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
-        "WHERE name='messages_fts'"
+    _execute_corruption_sql(
+        db_path,
+        """
+        PRAGMA writable_schema=ON;
+        INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+        SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master
+        WHERE name='messages_fts';
+        """,
     )
-    conn.commit()
-    conn.close()
 
 
 def test_duplicate_fts_makes_every_statement_fail(tmp_path):
@@ -270,9 +312,13 @@ def _corrupt_fts_index_data(db_path: Path) -> None:
     inverted index for FTS5 table" failure that fires on writes through the
     triggers while base-table reads still return rows.
     """
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
-    conn.execute("UPDATE messages_fts_data SET block = X'DEADBEEFDEADBEEF'")
-    conn.close()
+    _execute_corruption_sql(
+        db_path,
+        """
+        PRAGMA writable_schema=ON;
+        UPDATE messages_fts_data SET block = X'DEADBEEFDEADBEEF';
+        """,
+    )
 
 
 def test_fts_write_corruption_detected_by_write_probe(tmp_path):

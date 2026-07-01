@@ -188,14 +188,17 @@ def test_run_stdio_malware_check_times_out_fail_open():
     out, logs, and proceeds (fail-open) so the server still starts."""
     import time
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
+    hung_for = 8.0
+    timeout = 0.05
+    max_startup_s = 4.0
 
     def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
+        time.sleep(hung_for)  # far longer than timeout; catches sync blocking
         return "MALWARE"  # would block startup if awaited to completion
 
     async def _test():
         with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
-             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
+             patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", timeout), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
@@ -204,7 +207,9 @@ def test_run_stdio_malware_check_times_out_fail_open():
             await server.start({"command": "npx", "args": ["-y", "pkg"]})
             elapsed = time.monotonic() - start
             await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+        # Returned via fail-open timeout, not after the blocking check completed.
+        # Leave headroom for full-suite CPU pressure; a synchronous/blocking
+        # implementation would still take ~hung_for seconds and fail this.
+        assert elapsed < max_startup_s, f"startup did not fail-open promptly ({elapsed:.1f}s)"
 
     asyncio.run(_test())

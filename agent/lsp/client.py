@@ -72,6 +72,7 @@ DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+EXIT_GRACE = 0.25  # seconds to let a graceful LSP exit complete before SIGTERM
 
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
@@ -441,6 +442,11 @@ class LSPClient:
         if proc is None:
             return
         if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=EXIT_GRACE)
+                return
+            except asyncio.TimeoutError:
+                pass
             try:
                 proc.terminate()
                 try:

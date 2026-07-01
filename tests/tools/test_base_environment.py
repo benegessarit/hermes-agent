@@ -114,31 +114,34 @@ class TestAtomicSnapshotWrite:
         assert f"export -p > {snap} " not in wrapped
         assert f"export -p > '{snap}'" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_temp_path_uses_portable_unique_suffix_not_bare_dollardollar(self):
+        """The temp name must be unique per concurrent writer on Bash 3.2+.
+
+        ``$BASHPID`` is ideal where available, but macOS' Bash 3.2 lacks it.
+        The contract is therefore ``${BASHPID:-$$}`` plus random components,
+        assigned once and reused for export/mv/rm. Bare ``.tmp.$$`` is still
+        forbidden because concurrent ``&``-launched subshells share it.
+        """
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
+        assert "${BASHPID:-$$}" in wrapped
+        assert "${RANDOM:-0}" in wrapped
+        assert "__hermes_snap_tmp=" in wrapped
         # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
 
-    def test_temp_path_static_part_is_quoted_bashpid_outside(self):
+    def test_temp_path_static_part_is_quoted_suffix_outside(self):
         """The static path portion must be shlex-quoted (Windows/Git-Bash
-        ``C:/Users/...`` or spaces) while ``$BASHPID`` stays OUTSIDE the quotes
-        so it still expands."""
+        ``C:/Users/...`` or spaces) while the runtime suffix stays OUTSIDE the
+        quotes so it still expands."""
         env = _TestableEnv()
         env._snapshot_ready = True
         env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
         wrapped = env._wrap_command("echo hi", "/tmp")
         # The static path (with its space) is shlex-quoted as a single word, with
-        # $BASHPID appended OUTSIDE the quotes so it still expands at runtime.
-        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
+        # the suffix appended OUTSIDE the quotes so it still expands at runtime.
+        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'${BASHPID:-$$}" in wrapped
         # The space must never appear bare/unquoted in the temp token (that would
         # word-split into two args and break the redirect/mv).
         assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
@@ -153,10 +156,10 @@ class TestAtomicSnapshotWrite:
         assert "export -p > " in wrapped and "&& mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
-    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
+    def test_init_session_bootstrap_also_atomic_and_portable_unique(self):
         """The init_session bootstrap (first snapshot write) is the same shared
         file a concurrent command could source — it must be atomic and use
-        ``$BASHPID`` too."""
+        the same portable unique temp contract too."""
         env = _TestableEnv()
         captured = {}
 
@@ -171,7 +174,9 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
+        assert "${BASHPID:-$$}" in boot
+        assert "${RANDOM:-0}" in boot
+        assert "__hermes_snap_tmp=" in boot
         assert ".tmp.$$" not in boot
 
 
@@ -183,8 +188,8 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
-    unique), which is what closes the race; ``$$`` would still tear here.
+    that would corrupt PATH.  Crucially it uses one temp variable per writer
+    with a portable unique suffix; bare ``$$`` would still tear here.
     """
 
     def _run(self, script):
@@ -199,14 +204,14 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
+            f"( __hermes_snap_tmp={_q(snap + '.tmp.')}${{BASHPID:-$$}}.${{RANDOM:-0}}.${{RANDOM:-0}}; "
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
-            "done"
+            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
+            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true; "
+            "done )"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
         # an `export `/`declare -x` fragment (the corruption signature).
