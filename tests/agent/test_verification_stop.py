@@ -16,16 +16,7 @@ from agent.verification_stop import (
 
 def _node_project(root: Path) -> None:
     (root / "package.json").write_text(
-        json.dumps(
-            {
-                "scripts": {
-                    "test": "vitest",
-                    "lint": "eslint .",
-                    "build": "vite build",
-                    "check": "tsc --noEmit",
-                }
-            }
-        ),
+        json.dumps({"scripts": {"test": "vitest", "lint": "eslint ."}}),
         encoding="utf-8",
     )
     (root / "pnpm-lock.yaml").write_text("", encoding="utf-8")
@@ -192,80 +183,6 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
 
 
-def test_no_nudge_after_full_build_pass(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    _node_project(tmp_path)
-    changed = str(tmp_path / "src" / "app.ts")
-
-    record_terminal_result(
-        command="pnpm run build",
-        cwd=tmp_path,
-        session_id="s1",
-        exit_code=0,
-        output="built",
-    )
-
-    assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
-
-
-def test_targeted_test_pass_does_not_silence_guard(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    _node_project(tmp_path)
-    changed = str(tmp_path / "src" / "app.ts")
-
-    record_terminal_result(
-        command="pnpm test -- tests/button.test.tsx",
-        cwd=tmp_path,
-        session_id="s1",
-        exit_code=0,
-        output="1 passed",
-    )
-
-    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
-
-    assert nudge is not None
-    assert "passed targeted test" in nudge
-    assert "pnpm run test" in nudge
-
-
-def test_lint_pass_does_not_silence_guard(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    _node_project(tmp_path)
-    changed = str(tmp_path / "src" / "app.ts")
-
-    record_terminal_result(
-        command="pnpm run lint",
-        cwd=tmp_path,
-        session_id="s1",
-        exit_code=0,
-        output="lint clean",
-    )
-
-    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
-
-    assert nudge is not None
-    assert "passed full lint" in nudge
-
-
-def test_check_pass_does_not_silence_guard(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    _node_project(tmp_path)
-    changed = str(tmp_path / "src" / "app.ts")
-
-    record_terminal_result(
-        command="pnpm run check",
-        cwd=tmp_path,
-        session_id="s1",
-        exit_code=0,
-        output="types ok",
-    )
-
-    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
-
-    assert nudge is not None
-    assert "passed full check" in nudge
-
-
 def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     project_a = tmp_path / "a"
@@ -359,11 +276,11 @@ def test_verify_guidance_can_be_disabled(tmp_path, monkeypatch):
     assert "creative UI/visual work" not in nudge
 
 
-def test_ad_hoc_pass_does_not_masquerade_as_suite_green(tmp_path, monkeypatch):
+def test_ad_hoc_pass_satisfies_no_suite_stop_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     changed = str(tmp_path / "src" / "app.ts")
-    script = Path(tempfile.gettempdir()) / f"hermes-verify-stop-{tmp_path.name}.py"
+    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-stop-{tmp_path.name}.py"
     script.write_text("print('ok')\n", encoding="utf-8")
     try:
         record_terminal_result(
@@ -375,36 +292,6 @@ def test_ad_hoc_pass_does_not_masquerade_as_suite_green(tmp_path, monkeypatch):
         )
     finally:
         script.unlink(missing_ok=True)
-
-    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
-
-    assert nudge is not None
-    assert "passed targeted ad_hoc" in nudge
-    assert "ad-hoc verification" in nudge
-
-
-def test_lookup_failure_nudges_instead_of_failing_open(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    _node_project(tmp_path)
-    changed = str(tmp_path / "src" / "app.ts")
-
-    import agent.coding_context as coding_context
-
-    def broken_project_facts_for(cwd):
-        raise RuntimeError("project facts unavailable")
-
-    monkeypatch.setattr(coding_context, "project_facts_for", broken_project_facts_for)
-
-    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
-
-    assert nudge is not None
-    assert "unverified" in nudge
-    assert "ad-hoc verification" in nudge
-
-
-def test_no_project_facts_stays_quiet(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    changed = str(tmp_path / "scratch.py")
 
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
 

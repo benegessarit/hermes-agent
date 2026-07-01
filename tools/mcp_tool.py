@@ -89,7 +89,6 @@ import json
 import logging
 import math
 import os
-import queue
 import re
 import shutil
 import sys
@@ -111,64 +110,6 @@ logger = logging.getLogger(__name__)
 # first in the normal case; this outer bound only bites when a stalled SSL
 # handshake defeats the inner timeout (the #29184 failure mode).
 _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
-
-
-async def _run_osv_malware_check_fail_open(
-    *,
-    server_name: str,
-    command: str,
-    args: list[str],
-    check_package_for_malware: Callable[[str, list[str]], Optional[str]],
-) -> Optional[str]:
-    """Run the blocking OSV check without letting cancellation wait on it.
-
-    ``asyncio.wait_for(asyncio.to_thread(...))`` is not a hard wall-clock bound:
-    when the worker is already running, cancellation can wait for that thread to
-    finish. Use a daemon thread and poll from the event loop instead, so MCP
-    startup genuinely fails open when the network check hangs.
-    """
-    result_queue: queue.Queue[tuple[str, Optional[str] | BaseException]] = queue.Queue(maxsize=1)
-
-    def _worker() -> None:
-        try:
-            result_queue.put_nowait(("ok", check_package_for_malware(command, args)))
-        except BaseException as exc:  # preserve pre-existing propagation semantics
-            try:
-                result_queue.put_nowait(("error", exc))
-            except queue.Full:  # pragma: no cover - defensive race guard
-                pass
-
-    thread = threading.Thread(
-        target=_worker,
-        name=f"hermes-osv-preflight-{server_name}",
-        daemon=True,
-    )
-    thread.start()
-
-    deadline = time.monotonic() + _OSV_MALWARE_CHECK_TIMEOUT_S
-    while thread.is_alive():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            logger.warning(
-                "MCP server '%s': OSV malware preflight timed out after %.1fs "
-                "(network slow/unreachable) — proceeding without the check.",
-                server_name,
-                _OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-            return None
-        await asyncio.sleep(min(0.05, remaining))
-
-    try:
-        status, payload = result_queue.get_nowait()
-    except queue.Empty:  # pragma: no cover - worker exited without publishing
-        return None
-    if status == "error":
-        if isinstance(payload, BaseException):
-            raise payload
-        raise RuntimeError(str(payload))
-    if payload is not None and not isinstance(payload, str):
-        return str(payload)
-    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1880,16 +1821,20 @@ class MCPServerTask:
         # Run off the event loop (the urllib HTTPS call is blocking) and bound
         # it with a wall-clock timeout so a stalled SSL handshake can't freeze
         # MCP discovery / gateway startup (#29184). The check is fail-open, so
-        # on timeout we log and proceed rather than blocking indefinitely. Use a
-        # daemon thread helper rather than wait_for(to_thread(...)): cancelling
-        # a running worker thread can still wait for that thread to finish.
+        # on timeout we log and proceed rather than blocking indefinitely.
         from tools.osv_check import check_package_for_malware
-        malware_error = await _run_osv_malware_check_fail_open(
-            server_name=self.name,
-            command=command,
-            args=args,
-            check_package_for_malware=check_package_for_malware,
-        )
+        try:
+            malware_error = await asyncio.wait_for(
+                asyncio.to_thread(check_package_for_malware, command, args),
+                timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '%s': OSV malware preflight timed out after %.0fs "
+                "(network slow/unreachable) — proceeding without the check.",
+                self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
+            )
+            malware_error = None
         if malware_error:
             raise ValueError(
                 f"MCP server '{self.name}': {malware_error}"

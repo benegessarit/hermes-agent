@@ -29,16 +29,6 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
-@pytest.fixture(autouse=True)
-def no_real_claude_code_keychain(monkeypatch):
-    """Keep adapter auth tests hermetic on macOS hosts with Claude Code logged in."""
-
-    monkeypatch.setattr(
-        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
-        lambda: None,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -235,6 +225,13 @@ class TestBuildAnthropicClient:
 
 
 class TestReadClaudeCodeCredentials:
+    @pytest.fixture(autouse=True)
+    def no_keychain(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+            lambda: None,
+        )
+
     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
@@ -510,8 +507,7 @@ class TestResolveAnthropicToken:
 
 
 class TestRefreshOauthToken:
-    def test_returns_none_without_refresh_token(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    def test_returns_none_without_refresh_token(self):
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
@@ -548,8 +544,7 @@ class TestRefreshOauthToken:
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
-    def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    def test_failed_refresh_returns_none(self):
         creds = {
             "accessToken": "old",
             "refreshToken": "refresh-123",

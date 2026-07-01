@@ -20,8 +20,6 @@ import logging
 import random
 import re
 import sqlite3
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -424,7 +422,7 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     """Copy a (possibly malformed) DB file to a timestamped backup beside it.
 
     Raw file copy on purpose: the DB won't open cleanly, so we preserve the
-    exact bytes for manual recovery. WAL/SHM sidecars are best-effort
+    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
     copied too when present. Returns the backup path, or None on failure.
     """
     import datetime
@@ -442,32 +440,6 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None
-
-
-def _run_sqlite3_cli_script(db_path: Path, script: str) -> None:
-    """Run sqlite3 CLI surgery when embedded SQLite refuses writable_schema.
-
-    Some pyenv/macOS SQLite builds expose ``PRAGMA writable_schema`` but keep it
-    hard-disabled (readback remains 0), so embedded Python cannot repair a
-    malformed ``sqlite_master`` even though the system ``sqlite3`` CLI can. Use
-    argv+stdin only — never shell interpolation — because this operates on the
-    user's state DB during recovery.
-    """
-    sqlite3_cli = shutil.which("sqlite3")
-    if not sqlite3_cli:
-        raise sqlite3.DatabaseError(
-            "embedded SQLite refused writable_schema and sqlite3 CLI is unavailable"
-        )
-    proc = subprocess.run(
-        [sqlite3_cli, str(db_path)],
-        input=script,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-        raise sqlite3.DatabaseError(f"sqlite3 CLI repair failed: {detail}")
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
@@ -621,30 +593,16 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.commit()
         finally:
             conn.close()
+        if _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "dedup_schema"
+            logger.warning(
+                "state.db schema repaired by de-duplicating sqlite_master "
+                "(FTS index preserved): %s", db_path
+            )
+            return report
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db dedup repair pass failed: %s", exc)
-        try:
-            _run_sqlite3_cli_script(
-                db_path,
-                """
-                PRAGMA writable_schema=ON;
-                DELETE FROM sqlite_master
-                WHERE rowid NOT IN (
-                    SELECT MIN(rowid) FROM sqlite_master GROUP BY type, name
-                );
-                PRAGMA writable_schema=OFF;
-                """,
-            )
-        except sqlite3.DatabaseError as cli_exc:
-            logger.warning("state.db dedup sqlite3 CLI fallback failed: %s", cli_exc)
-    if _db_opens_cleanly(db_path) is None:
-        report["repaired"] = True
-        report["strategy"] = "dedup_schema"
-        logger.warning(
-            "state.db schema repaired by de-duplicating sqlite_master "
-            "(FTS index preserved): %s", db_path
-        )
-        return report
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     try:
@@ -657,30 +615,18 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.execute("VACUUM")
         finally:
             conn.close()
-    except sqlite3.DatabaseError as exc:
-        logger.warning("state.db drop-FTS repair pass failed: %s", exc)
-        try:
-            _run_sqlite3_cli_script(
-                db_path,
-                """
-                PRAGMA writable_schema=ON;
-                DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%';
-                PRAGMA writable_schema=OFF;
-                VACUUM;
-                """,
+        reason = _db_opens_cleanly(db_path)
+        if reason is None:
+            report["repaired"] = True
+            report["strategy"] = "drop_fts_rebuild"
+            logger.warning(
+                "state.db schema repaired by dropping FTS schema; indexes "
+                "will rebuild from messages on next open: %s", db_path
             )
-        except sqlite3.DatabaseError as cli_exc:
-            report["error"] = str(cli_exc)
-    reason = _db_opens_cleanly(db_path)
-    if reason is None:
-        report["repaired"] = True
-        report["strategy"] = "drop_fts_rebuild"
-        logger.warning(
-            "state.db schema repaired by dropping FTS schema; indexes "
-            "will rebuild from messages on next open: %s", db_path
-        )
-        return report
-    report["error"] = reason
+            return report
+        report["error"] = reason
+    except sqlite3.DatabaseError as exc:
+        report["error"] = str(exc)
 
     if not report["repaired"]:
         logger.error(

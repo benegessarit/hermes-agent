@@ -188,43 +188,6 @@ def _candidate_cwds(paths: Iterable[str]) -> list[Path]:
     return candidates
 
 
-def _synthetic_unverified_snapshot(
-    changed_paths: list[str],
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """Return visible unverified state when verifier lookup itself is unavailable."""
-    candidates = _candidate_cwds(changed_paths)
-    if not candidates:
-        return None
-    root = str(candidates[0])
-    return (
-        {
-            "status": "unverified",
-            "evidence": None,
-            "root": root,
-            "changed_paths": changed_paths,
-        },
-        {
-            "root": root,
-            "manifests": [],
-            "packageManagers": [],
-            "verifyCommands": [],
-            "contextFiles": [],
-        },
-    )
-
-
-def _status_satisfies_stop_guard(status: dict[str, Any]) -> bool:
-    """Return whether evidence is strong enough to silence verify-on-stop."""
-    if str(status.get("status") or "unverified") != "passed":
-        return False
-    evidence = status.get("evidence")
-    if not isinstance(evidence, dict):
-        return False
-    kind = str(evidence.get("kind") or "")
-    scope = str(evidence.get("scope") or "")
-    return scope == "full" and kind in {"test", "build"}
-
-
 def _verification_snapshot(
     *,
     session_id: str | None,
@@ -235,21 +198,18 @@ def _verification_snapshot(
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import verification_status
     except Exception:
-        return _synthetic_unverified_snapshot(changed_paths)
+        return None
 
     first_snapshot: tuple[dict[str, Any], dict[str, Any]] | None = None
     for cwd in _candidate_cwds(changed_paths):
-        try:
-            facts = project_facts_for(cwd)
-            if not facts:
-                continue
-            status = verification_status(session_id=session_id, cwd=cwd)
-        except Exception:
-            return _synthetic_unverified_snapshot(changed_paths)
+        facts = project_facts_for(cwd)
+        if not facts:
+            continue
+        status = verification_status(session_id=session_id, cwd=cwd)
         snapshot = (status, facts)
         if first_snapshot is None:
             first_snapshot = snapshot
-        if not _status_satisfies_stop_guard(status):
+        if str(status.get("status") or "unverified") != "passed":
             return snapshot
     return first_snapshot
 
@@ -269,12 +229,9 @@ def _status_detail(status: dict[str, Any]) -> str:
     if not evidence:
         return state
 
-    kind = str(evidence.get("kind") or "").strip()
-    scope = str(evidence.get("scope") or "").strip()
     command = evidence.get("canonical_command") or evidence.get("command")
     summary = str(evidence.get("output_summary") or "").strip()
-    evidence_detail = " ".join(part for part in (scope, kind) if part)
-    parts = [f"{state} {evidence_detail}".strip()]
+    parts = [state]
     if command:
         parts.append(f"last command `{command}`")
     if summary:
@@ -311,7 +268,8 @@ def build_verify_on_stop_nudge(
         if str(cmd).strip()
     ]
 
-    if _status_satisfies_stop_guard(status):
+    state = str(status.get("status") or "unverified")
+    if state == "passed":
         return None
 
     # Optional shipped coding guidance, only paid when this evidence gate fires.
